@@ -32,6 +32,13 @@
   button:hover { background: #555; }
   button.on { background: #06c; border-color: #06c; }
   input[type=range] { width: 100px; }
+  input[type=number].num-sync {
+    width: 48px;
+    background: #444; color: #eee;
+    border: 1px solid #555; border-radius: 3px;
+    padding: 2px 4px;
+    font: 12px/1 monospace;
+  }
   label { font-size: 12px; }
   #swatchBtn {
     width: 30px; height: 30px; padding: 0;
@@ -91,6 +98,21 @@
   #hint { color: #888; padding: 40px; text-align: center; }
   .drop { position: fixed; inset: 0; background: rgba(0,100,200,.3); display: none; align-items: center; justify-content: center; font-size: 24px; pointer-events: none; }
   .drop.on { display: flex; }
+  #ctxMenu {
+    position: fixed;
+    background: #2a2a2a;
+    border: 1px solid #555;
+    border-radius: 5px;
+    padding: 8px 12px;
+    z-index: 200;
+    box-shadow: 0 6px 24px rgba(0,0,0,.6);
+    font-size: 12px;
+    display: none;
+  }
+  #ctxMenu table { border-collapse: collapse; }
+  #ctxMenu td { padding: 3px 6px; }
+  #ctxMenu td:first-child { color: #aaa; white-space: nowrap; }
+  #ctxMenu td:last-child { color: #eee; }
 </style>
 </head>
 <body>
@@ -105,14 +127,18 @@
   <input type="text" id="hex" value="#FF0000" maxlength="7">
   <span id="preset"></span>
   <span id="recent"></span>
-  <label>太さ <input type="range" id="sz" min="1" max="100" value="15"></label>
-  <label>許容差 <input type="range" id="tol" min="0" max="150" value="30"></label>
+  <label>太さ <input type="range" id="sz" min="1" max="100" value="15"> <input type="number" class="num-sync" id="szNum" min="1" max="100" step="1" value="15"></label>
+  <label>許容差 <input type="range" id="tol" min="0" max="150" value="30"> <input type="number" class="num-sync" id="tolNum" min="0" max="150" step="1" value="30"></label>
+  <label title="クロージング半径(0=OFF)">穴埋め <input type="number" class="num-sync" id="closeR" min="0" max="5" step="1" value="1" style="width:40px"></label>
+  <label title="境界ソフト化"><input type="checkbox" id="softenChk" checked> 境界補完</label>
+  <label title="連結のみ選択"><input type="checkbox" id="connectedChk" checked> 連結のみ</label>
   <button onclick="fillSel()">選択を塗る</button>
   <button onclick="delSel()">選択を透過(Del)</button>
   <button onclick="clearSel()">選択解除</button>
   <button onclick="undo()">元に戻す</button>
   <button onclick="exp('png')">PNG</button>
   <button onclick="exp('svg')">SVG</button>
+  <button id="bgBtn" onclick="cycleBg()" title="市松">背景</button>
 </header>
 
 <main>
@@ -126,6 +152,18 @@
 <div id="picker" hidden><canvas id="pickCanvas" width="220" height="220"></canvas></div>
 <div class="drop" id="drop">ドロップで読み込み</div>
 <input type="file" id="f" accept="image/*" style="display:none">
+<div id="ctxMenu">
+  <table>
+    <tr><td>ホイール</td><td>スクロール</td></tr>
+    <tr><td>Alt+ホイール</td><td>拡大縮小</td></tr>
+    <tr><td>スペース+ドラッグ</td><td>手のひら（パン）</td></tr>
+    <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>元に戻す / やり直し</td></tr>
+    <tr><td>Ctrl+0</td><td>画面にフィット</td></tr>
+    <tr><td>Del / Backspace</td><td>選択範囲を透過</td></tr>
+    <tr><td>Esc</td><td>選択解除</td></tr>
+    <tr><td>右クリック</td><td>このヘルプ表示</td></tr>
+  </table>
+</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/imagetracerjs/1.2.6/imagetracer_v1.2.6.min.js"></script>
 <script>
@@ -149,8 +187,16 @@ document.getElementById('hex').oninput = e => {
   if (!v.startsWith('#')) v = '#' + v;
   if (/^#[0-9a-fA-F]{6}$/.test(v)) setColor(v);
 };
-document.getElementById('sz').oninput = e => size = +e.target.value;
-document.getElementById('tol').oninput = e => tol = +e.target.value;
+
+// スライダー ↔ 数値入力 双方向同期
+const szRange = document.getElementById('sz');
+const szNum   = document.getElementById('szNum');
+const tolRange = document.getElementById('tol');
+const tolNum   = document.getElementById('tolNum');
+szRange.oninput = e => { size = +e.target.value; szNum.value = size; };
+szNum.oninput   = e => { size = Math.max(1, Math.min(100, +e.target.value)); szRange.value = size; };
+tolRange.oninput = e => { tol = +e.target.value; tolNum.value = tol; };
+tolNum.oninput   = e => { tol = Math.max(0, Math.min(150, +e.target.value)); tolRange.value = tol; };
 
 // パレット
 const DEFAULTS = ['#000000','#ffffff','#808080','#ff0000','#ff8c00','#ffd700','#00c853','#00bcd4','#2196f3','#3f51b5','#9c27b0','#e91e63'];
@@ -503,24 +549,87 @@ function bucket(sx, sy) {
   ctx.putImageData(im, 0, 0);
 }
 
+// wand後処理: マスク内部の小穴を埋める (dilate→erode)
+function closeMask(mask, w, h, r) {
+  if (r <= 0) return;
+  let cur = mask;
+  // dilate r回
+  for (let pass = 0; pass < r; pass++) {
+    const next = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (cur[y*w+x]) { next[y*w+x] = 1; continue; }
+      if ((x>0 && cur[y*w+x-1]) || (x<w-1 && cur[y*w+x+1]) ||
+          (y>0 && cur[(y-1)*w+x]) || (y<h-1 && cur[(y+1)*w+x])) next[y*w+x] = 1;
+    }
+    cur = next;
+  }
+  // erode r回
+  for (let pass = 0; pass < r; pass++) {
+    const next = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (!cur[y*w+x]) continue;
+      if ((x>0 && !cur[y*w+x-1]) || (x<w-1 && !cur[y*w+x+1]) ||
+          (y>0 && !cur[(y-1)*w+x]) || (y<h-1 && !cur[(y+1)*w+x])) continue;
+      next[y*w+x] = 1;
+    }
+    cur = next;
+  }
+  for (let i = 0; i < mask.length; i++) mask[i] = cur[i];
+}
+
+// wand後処理: 境界画素の近傍を softer tol で追加
+function softenEdge(mask, w, h, r0, g0, b0, a0, tolSoft, d) {
+  const ts2 = tolSoft * tolSoft * 4;
+  const orig = mask.slice();
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!orig[y*w+x]) continue;
+    // 境界画素か確認
+    const isBorder = (x>0 && !orig[y*w+x-1]) || (x<w-1 && !orig[y*w+x+1]) ||
+                     (y>0 && !orig[(y-1)*w+x]) || (y<h-1 && !orig[(y+1)*w+x]);
+    if (!isBorder) continue;
+    const nb = [[x-1,y],[x+1,y],[x,y-1],[x,y+1]];
+    for (const [nx,ny] of nb) {
+      if (nx<0||ny<0||nx>=w||ny>=h) continue;
+      if (orig[ny*w+nx]) continue;
+      const k = (ny*w+nx)*4;
+      const dr=d[k]-r0, dg=d[k+1]-g0, db=d[k+2]-b0, da=d[k+3]-a0;
+      if (dr*dr+dg*dg+db*db+da*da <= ts2) mask[ny*w+nx] = 1;
+    }
+  }
+}
+
 function wand(sx, sy) {
   const w = cv.width, h = cv.height;
   const im = ctx.getImageData(0,0,w,h), d = im.data;
   const i0 = (sy*w + sx)*4;
   const r0=d[i0], g0=d[i0+1], b0=d[i0+2], a0=d[i0+3];
   mask.fill(0);
-  const st = [sx, sy];
   const t2 = tol*tol*4;
-  while (st.length) {
-    const y = st.pop(), x = st.pop();
-    if (x<0||y<0||x>=w||y>=h) continue;
-    const i = y*w+x;
-    if (mask[i]) continue;
-    const k = i*4;
-    const dr=d[k]-r0, dg=d[k+1]-g0, db=d[k+2]-b0, da=d[k+3]-a0;
-    if (dr*dr+dg*dg+db*db+da*da > t2) continue;
-    mask[i] = 1;
-    st.push(x+1,y, x-1,y, x,y+1, x,y-1);
+  const connected = document.getElementById('connectedChk').checked;
+  if (connected) {
+    const st = [sx, sy];
+    while (st.length) {
+      const y = st.pop(), x = st.pop();
+      if (x<0||y<0||x>=w||y>=h) continue;
+      const i = y*w+x;
+      if (mask[i]) continue;
+      const k = i*4;
+      const dr=d[k]-r0, dg=d[k+1]-g0, db=d[k+2]-b0, da=d[k+3]-a0;
+      if (dr*dr+dg*dg+db*db+da*da > t2) continue;
+      mask[i] = 1;
+      st.push(x+1,y, x-1,y, x,y+1, x,y-1);
+    }
+  } else {
+    for (let i = 0; i < w*h; i++) {
+      const k = i*4;
+      const dr=d[k]-r0, dg=d[k+1]-g0, db=d[k+2]-b0, da=d[k+3]-a0;
+      if (dr*dr+dg*dg+db*db+da*da <= t2) mask[i] = 1;
+    }
+  }
+  const closeR = +document.getElementById('closeR').value;
+  closeMask(mask, w, h, closeR);
+  if (document.getElementById('softenChk').checked) {
+    softenEdge(mask, w, h, r0, g0, b0, a0, tol * 1.8, d);
   }
   hasSel = true;
   renderSel();
@@ -638,7 +747,7 @@ function dl(b, n) {
 
 function hex2rgb(h) { const v = parseInt(h.slice(1), 16); return { r:(v>>16)&255, g:(v>>8)&255, b:v&255 }; }
 
-// ホイールでズーム（カーソル位置を中心に）
+// Alt+ホイールでズーム（カーソル位置を中心に）
 let zoom = 1;
 function applyZoom() {
   const w = cv.width * zoom, h = cv.height * zoom;
@@ -656,6 +765,7 @@ function fit() {
   mainEl.scrollTop = 0;
 }
 mainEl.addEventListener('wheel', e => {
+  if (!e.altKey) return;
   if (!mask) return;
   e.preventDefault();
   const old = zoom;
@@ -668,6 +778,41 @@ mainEl.addEventListener('wheel', e => {
   mainEl.scrollLeft += mx * k;
   mainEl.scrollTop  += my * k;
 }, { passive: false });
+
+// 背景切替
+const BG_MODES = [
+  { title: '市松', bg: 'linear-gradient(45deg,#2a2a2a 25%,transparent 25%) 0 0/16px 16px,linear-gradient(-45deg,#2a2a2a 25%,transparent 25%) 0 8px/16px 16px,linear-gradient(45deg,transparent 75%,#2a2a2a 75%) 8px -8px/16px 16px,linear-gradient(-45deg,transparent 75%,#2a2a2a 75%) -8px 0/16px 16px,#1e1e1e' },
+  { title: 'ダーク', bg: '#1e1e1e' },
+  { title: '黒', bg: '#000' },
+  { title: '白', bg: '#fff' },
+  { title: 'グレー', bg: '#888' },
+];
+let bgIdx = 0;
+function cycleBg() {
+  bgIdx = (bgIdx + 1) % BG_MODES.length;
+  const m = BG_MODES[bgIdx];
+  mainEl.style.background = m.bg;
+  document.getElementById('bgBtn').title = m.title;
+}
+
+// 右クリックショートカット一覧
+const ctxMenu = document.getElementById('ctxMenu');
+mainEl.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  ctxMenu.style.display = 'block';
+  const mx = Math.min(e.clientX, window.innerWidth - ctxMenu.offsetWidth - 8);
+  const my = Math.min(e.clientY, window.innerHeight - ctxMenu.offsetHeight - 8);
+  ctxMenu.style.left = Math.max(0, mx) + 'px';
+  ctxMenu.style.top  = Math.max(0, my) + 'px';
+});
+document.addEventListener('mousedown', e => {
+  if (ctxMenu.style.display === 'block' && !ctxMenu.contains(e.target)) {
+    ctxMenu.style.display = 'none';
+  }
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') ctxMenu.style.display = 'none';
+}, true);
 </script>
 </body>
 </html>
