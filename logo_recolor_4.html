@@ -95,6 +95,7 @@
   .wrap { position: relative; box-shadow: 0 0 16px rgba(0,0,0,.5); }
   canvas { display: block; }
   #sel { position: absolute; inset: 0; pointer-events: none; }
+  #penOverlay { position: absolute; inset: 0; pointer-events: none; }
   #hint { color: #888; padding: 40px; text-align: center; }
   .drop { position: fixed; inset: 0; background: rgba(0,100,200,.3); display: none; align-items: center; justify-content: center; font-size: 24px; pointer-events: none; }
   .drop.on { display: flex; }
@@ -135,6 +136,7 @@
   <button id="t-sel" onclick="setTool('sel')">筆選択</button>
   <button id="t-spuit" onclick="setTool('spuit')">スポイト</button>
   <button id="t-replace" onclick="setTool('replace')">色置換</button>
+  <button id="t-pen" onclick="setTool('pen')">パス</button>
   <button id="swatchBtn" style="background:#ff0000" onclick="togglePicker(event)"></button>
   <input type="text" id="hex" value="#FF0000" maxlength="7">
   <span id="preset"></span>
@@ -161,6 +163,7 @@
   <div class="wrap" id="wrap" style="display:none">
     <canvas id="cv"></canvas>
     <canvas id="sel"></canvas>
+    <canvas id="penOverlay"></canvas>
   </div>
 </main>
 
@@ -185,6 +188,13 @@
     <tr><td>S</td><td>筆選択</td></tr>
     <tr><td>I</td><td>スポイト</td></tr>
     <tr><td>R</td><td>色置換</td></tr>
+    <tr><td>P</td><td>パス（ベジェ）</td></tr>
+    <tr><td colspan="2" style="color:#666;padding-top:6px">パス操作</td></tr>
+    <tr><td>クリック+ドラッグ</td><td>アンカー＋カーブハンドル</td></tr>
+    <tr><td>Enter / ダブルクリック</td><td>パス確定</td></tr>
+    <tr><td>始点クリック</td><td>パスを閉じる</td></tr>
+    <tr><td>右クリック</td><td>アンカー削除</td></tr>
+    <tr><td>Esc</td><td>パス破棄</td></tr>
     <tr><td colspan="2" style="color:#666;padding-top:6px">自動選択（Wand）修飾キー</td></tr>
     <tr><td>クリック</td><td>選択置換</td></tr>
     <tr><td>Shift+クリック</td><td>選択追加</td></tr>
@@ -201,17 +211,27 @@ const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d', { willReadFrequently: true });
 const sel = document.getElementById('sel');
 const sctx = sel.getContext('2d');
+const penOverlay = document.getElementById('penOverlay');
+const poctx = penOverlay.getContext('2d');
 let tool = 'brush', col = '#ff0000', size = 15, tol = 30, feather = 0, repTol = 30;
 let mask = null, hasSel = false, drawing = false, lx = 0, ly = 0;
 let hist = [], idx = -1;
 
+let penPath = [];
+let penDrag = null;
+let penClosed = false;
+
 function setTool(t) {
+  if (tool === 'pen' && t !== 'pen') {
+    if (penPath.length >= 2) rasterizePen();
+    else { penPath = []; penClosed = false; penDrag = null; drawPenOverlay(); }
+  }
   tool = t;
   document.querySelectorAll('[id^=t-]').forEach(b => b.classList.remove('on'));
   const btn = document.getElementById('t-' + t);
   if (btn) btn.classList.add('on');
   updateBrushCursorVisibility();
-  cv.style.cursor = (t === 'spuit' || t === 'replace') ? 'crosshair' : '';
+  cv.style.cursor = (t === 'spuit' || t === 'replace' || t === 'pen') ? 'crosshair' : '';
 }
 
 // Hex入力
@@ -450,8 +470,8 @@ function loadSvg(text) {
 function loadImg(src) {
   const img = new Image();
   img.onload = () => {
-    cv.width = sel.width = img.naturalWidth;
-    cv.height = sel.height = img.naturalHeight;
+    cv.width = sel.width = penOverlay.width = img.naturalWidth;
+    cv.height = sel.height = penOverlay.height = img.naturalHeight;
     document.getElementById('hint').style.display = 'none';
     document.getElementById('wrap').style.display = 'block';
     fit();
@@ -459,6 +479,8 @@ function loadImg(src) {
     ctx.drawImage(img, 0, 0);
     mask = new Uint8Array(cv.width * cv.height);
     hasSel = false;
+    penPath = []; penClosed = false; penDrag = null;
+    poctx.clearRect(0, 0, penOverlay.width, penOverlay.height);
     hist = []; idx = -1; save();
   };
   img.src = src;
@@ -490,6 +512,12 @@ cv.onmousedown = e => {
     return;
   }
   if (!mask) return;
+
+  if (tool === 'pen') {
+    penMouseDown(e);
+    return;
+  }
+
   const { x, y } = coord(e);
   drawing = true; lx = x; ly = y;
 
@@ -520,6 +548,7 @@ cv.onmousedown = e => {
 cv.onmousemove = e => {
   if (panning) return;
   updateBrushCursorPos(e);
+  if (tool === 'pen') return;
   if (!drawing) return;
   const { x, y } = coord(e);
   if (tool === 'brush') line(lx, ly, x, y);
@@ -535,10 +564,13 @@ addEventListener('mousemove', e => {
   if (panning) {
     mainEl.scrollLeft = panSL - (e.clientX - panSX);
     mainEl.scrollTop  = panST - (e.clientY - panSY);
+    return;
   }
+  if (tool === 'pen') penMouseMove(e);
 });
 addEventListener('mouseup', () => {
   if (panning) { panning = false; document.body.style.cursor = spaceDown ? 'grab' : ''; return; }
+  penDrag = null;
   if (drawing && tool === 'brush') save();
   if (drawing && tool === 'sel' && feather > 0) renderSel();
   drawing = false;
@@ -931,7 +963,16 @@ addEventListener('keydown', e => {
   const t = (e.target.tagName||'').toLowerCase();
   if (t==='input' || t==='textarea') return;
   if (e.key==='Delete' || e.key==='Backspace') { if (hasSel) { e.preventDefault(); delSel(); } }
-  else if (e.key==='Escape') clearSel();
+  else if (e.key==='Escape') {
+    if (tool === 'pen' && penPath.length) {
+      penPath = []; penClosed = false; penDrag = null; drawPenOverlay();
+    } else {
+      clearSel();
+    }
+  }
+  else if (e.key==='Enter') {
+    if (tool === 'pen' && penPath.length >= 2) { e.preventDefault(); rasterizePen(); }
+  }
   else if ((e.ctrlKey||e.metaKey) && (e.key==='z' || e.key==='Z')) { e.preventDefault(); e.shiftKey ? redo() : undo(); }
   else if ((e.ctrlKey||e.metaKey) && e.key==='0') { e.preventDefault(); fit(); }
   else if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
@@ -941,6 +982,7 @@ addEventListener('keydown', e => {
     else if (e.key === 's' || e.key === 'S') setTool('sel');
     else if (e.key === 'i' || e.key === 'I') setTool('spuit');
     else if (e.key === 'r' || e.key === 'R') setTool('replace');
+    else if (e.key === 'p' || e.key === 'P') setTool('pen');
   }
 });
 addEventListener('keyup', e => {
@@ -957,8 +999,14 @@ function save() {
   if (hist.length > 90) hist.shift();
   idx = hist.length - 1;
 }
-function undo() { if (idx > 0) { idx--; ctx.putImageData(hist[idx], 0, 0); } }
-function redo() { if (idx < hist.length - 1) { idx++; ctx.putImageData(hist[idx], 0, 0); } }
+function undo() {
+  if (penPath.length) { penPath = []; penClosed = false; penDrag = null; drawPenOverlay(); }
+  if (idx > 0) { idx--; ctx.putImageData(hist[idx], 0, 0); }
+}
+function redo() {
+  if (penPath.length) { penPath = []; penClosed = false; penDrag = null; drawPenOverlay(); }
+  if (idx < hist.length - 1) { idx++; ctx.putImageData(hist[idx], 0, 0); }
+}
 
 function exp(fmt) {
   if (!cv.width) return;
@@ -992,8 +1040,8 @@ function hex2rgb(h) { const v = parseInt(h.slice(1), 16); return { r:(v>>16)&255
 let zoom = 1;
 function applyZoom() {
   const w = cv.width * zoom, h = cv.height * zoom;
-  cv.style.width = sel.style.width = w + 'px';
-  cv.style.height = sel.style.height = h + 'px';
+  cv.style.width = sel.style.width = penOverlay.style.width = w + 'px';
+  cv.style.height = sel.style.height = penOverlay.style.height = h + 'px';
   updateBrushCursorSize();
 }
 const mainEl = document.querySelector('main');
@@ -1040,6 +1088,24 @@ function cycleBg() {
 // 右クリックショートカット一覧
 const ctxMenu = document.getElementById('ctxMenu');
 mainEl.addEventListener('contextmenu', e => {
+  if (tool === 'pen') {
+    e.preventDefault();
+    const r = cv.getBoundingClientRect();
+    const fx = (e.clientX - r.left) * cv.width / r.width;
+    const fy = (e.clientY - r.top) * cv.height / r.height;
+    const hitR = Math.min(Math.max(8 / zoom, 3), 20);
+    let hitIdx = -1;
+    for (let i = 0; i < penPath.length; i++) {
+      const dx = penPath[i].x - fx, dy = penPath[i].y - fy;
+      if (Math.sqrt(dx*dx + dy*dy) <= hitR) { hitIdx = i; break; }
+    }
+    if (hitIdx >= 0) {
+      penPath.splice(hitIdx, 1);
+      if (penPath.length < 3) penClosed = false;
+      drawPenOverlay();
+    }
+    return;
+  }
   e.preventDefault();
   ctxMenu.style.display = 'block';
   const mx = Math.min(e.clientX, window.innerWidth - ctxMenu.offsetWidth - 8);
@@ -1055,6 +1121,272 @@ document.addEventListener('mousedown', e => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') ctxMenu.style.display = 'none';
 }, true);
+
+// --- ベジェペンツール ---
+
+function coordF(e) {
+  const r = cv.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * cv.width / r.width,
+    y: (e.clientY - r.top) * cv.height / r.height
+  };
+}
+
+function penHitRadius() {
+  return Math.min(Math.max(8 / zoom, 3), 20);
+}
+
+function penMouseMove(e) {
+  const { x, y } = coordF(e);
+
+  if (penDrag) {
+    const i = penDrag.index;
+    const p = penPath[i];
+    if (penDrag.kind === 'new') {
+      // ドラッグでハンドル引き出し
+      p.hOut = { x, y };
+      p.hIn = { x: 2 * p.x - x, y: 2 * p.y - y };
+    } else if (penDrag.kind === 'hOut') {
+      p.hOut = { x, y };
+      if (!e.altKey) {
+        // 対称ハンドル
+        p.hIn = { x: 2 * p.x - x, y: 2 * p.y - y };
+      }
+    } else if (penDrag.kind === 'hIn') {
+      p.hIn = { x, y };
+      if (!e.altKey) {
+        p.hOut = { x: 2 * p.x - x, y: 2 * p.y - y };
+      }
+    } else if (penDrag.kind === 'anchor') {
+      const dx = x - p.x, dy = y - p.y;
+      if (p.hIn) { p.hIn.x += dx; p.hIn.y += dy; }
+      if (p.hOut) { p.hOut.x += dx; p.hOut.y += dy; }
+      p.x = x; p.y = y;
+    }
+    drawPenOverlay();
+    return;
+  }
+
+  // 非ドラッグ: プレビュー（最後アンカー→マウスの曲線）
+  if (penPath.length >= 1) {
+    drawPenOverlay(x, y);
+  }
+}
+
+function drawPenOverlay(previewX, previewY) {
+  poctx.clearRect(0, 0, penOverlay.width, penOverlay.height);
+  if (penPath.length === 0) return;
+
+  const hasPrev = previewX !== undefined;
+
+  // 確定済みセグメントを描画
+  if (penPath.length >= 2 || (penPath.length === 1 && penClosed)) {
+    const len = penClosed ? penPath.length : penPath.length - 1;
+    poctx.save();
+    // 白い太い線（下敷き）
+    poctx.strokeStyle = 'rgba(255,255,255,0.8)';
+    poctx.lineWidth = 3 / zoom;
+    poctx.lineCap = 'round';
+    poctx.lineJoin = 'round';
+    poctx.beginPath();
+    poctx.moveTo(penPath[0].x, penPath[0].y);
+    for (let i = 0; i < len; i++) {
+      const p0 = penPath[i];
+      const p1 = penPath[(i + 1) % penPath.length];
+      const c1x = p0.hOut ? p0.hOut.x : p0.x;
+      const c1y = p0.hOut ? p0.hOut.y : p0.y;
+      const c2x = p1.hIn ? p1.hIn.x : p1.x;
+      const c2y = p1.hIn ? p1.hIn.y : p1.y;
+      poctx.bezierCurveTo(c1x, c1y, c2x, c2y, p1.x, p1.y);
+    }
+    poctx.stroke();
+    // マゼンタの細い線（上書き）
+    poctx.strokeStyle = 'rgba(220,0,220,0.9)';
+    poctx.lineWidth = 1.5 / zoom;
+    poctx.beginPath();
+    poctx.moveTo(penPath[0].x, penPath[0].y);
+    for (let i = 0; i < len; i++) {
+      const p0 = penPath[i];
+      const p1 = penPath[(i + 1) % penPath.length];
+      const c1x = p0.hOut ? p0.hOut.x : p0.x;
+      const c1y = p0.hOut ? p0.hOut.y : p0.y;
+      const c2x = p1.hIn ? p1.hIn.x : p1.x;
+      const c2y = p1.hIn ? p1.hIn.y : p1.y;
+      poctx.bezierCurveTo(c1x, c1y, c2x, c2y, p1.x, p1.y);
+    }
+    poctx.stroke();
+    poctx.restore();
+  }
+
+  // プレビューセグメント（最後のアンカー→マウス）
+  if (hasPrev && !penClosed && penPath.length >= 1) {
+    const last = penPath[penPath.length - 1];
+    const c1x = last.hOut ? last.hOut.x : last.x;
+    const c1y = last.hOut ? last.hOut.y : last.y;
+    poctx.save();
+    poctx.setLineDash([4 / zoom, 4 / zoom]);
+    poctx.strokeStyle = 'rgba(220,0,220,0.5)';
+    poctx.lineWidth = 1.5 / zoom;
+    poctx.lineCap = 'round';
+    poctx.beginPath();
+    poctx.moveTo(last.x, last.y);
+    poctx.bezierCurveTo(c1x, c1y, previewX, previewY, previewX, previewY);
+    poctx.stroke();
+    poctx.restore();
+  }
+
+  // アンカー点・ハンドル描画
+  const ar = 4 / zoom;
+  const hr = 3 / zoom;
+  for (let i = 0; i < penPath.length; i++) {
+    const p = penPath[i];
+
+    // ハンドル線＋円
+    poctx.save();
+    poctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    poctx.lineWidth = 1 / zoom;
+    if (p.hIn) {
+      poctx.beginPath();
+      poctx.moveTo(p.x, p.y);
+      poctx.lineTo(p.hIn.x, p.hIn.y);
+      poctx.stroke();
+      poctx.beginPath();
+      poctx.arc(p.hIn.x, p.hIn.y, hr, 0, Math.PI * 2);
+      poctx.strokeStyle = 'rgba(100,180,255,0.9)';
+      poctx.stroke();
+    }
+    if (p.hOut) {
+      poctx.strokeStyle = 'rgba(255,255,255,0.7)';
+      poctx.lineWidth = 1 / zoom;
+      poctx.beginPath();
+      poctx.moveTo(p.x, p.y);
+      poctx.lineTo(p.hOut.x, p.hOut.y);
+      poctx.stroke();
+      poctx.beginPath();
+      poctx.arc(p.hOut.x, p.hOut.y, hr, 0, Math.PI * 2);
+      poctx.strokeStyle = 'rgba(100,180,255,0.9)';
+      poctx.stroke();
+    }
+    poctx.restore();
+
+    // アンカー□
+    const isFirst = i === 0;
+    const canClose = isFirst && penPath.length >= 3 && !penClosed;
+    poctx.save();
+    poctx.fillStyle = canClose ? 'rgba(255,200,0,0.9)' : 'rgba(255,255,255,0.9)';
+    poctx.strokeStyle = 'rgba(0,0,0,0.8)';
+    poctx.lineWidth = 1 / zoom;
+    poctx.fillRect(p.x - ar, p.y - ar, ar * 2, ar * 2);
+    poctx.strokeRect(p.x - ar, p.y - ar, ar * 2, ar * 2);
+    poctx.restore();
+  }
+}
+
+let penLastClickTime = 0;
+let penLastClickX = 0, penLastClickY = 0;
+
+function penMouseDown(e) {
+  if (e.button !== 0) return;
+  const { x, y } = coordF(e);
+  const hr = penHitRadius();
+  const now = Date.now();
+
+  // ダブルクリック判定
+  const isDbl = (now - penLastClickTime < 400) &&
+    Math.abs(x - penLastClickX) < hr && Math.abs(y - penLastClickY) < hr;
+  penLastClickTime = now;
+  penLastClickX = x; penLastClickY = y;
+
+  if (isDbl && penPath.length >= 2) {
+    // ダブルクリック: 直前 mousedown で追加された余分なアンカーを除去してから確定
+    const last = penPath[penPath.length - 1];
+    const prev = penPath.length >= 2 ? penPath[penPath.length - 2] : null;
+    if (prev) {
+      const ddx = last.x - prev.x, ddy = last.y - prev.y;
+      if (Math.sqrt(ddx*ddx + ddy*ddy) < hr) {
+        penPath.pop();
+      }
+    }
+    if (penPath.length >= 2) rasterizePen();
+    return;
+  }
+
+  // ①ハンドル近傍
+  for (let i = 0; i < penPath.length; i++) {
+    const p = penPath[i];
+    if (p.hIn) {
+      const dx = p.hIn.x - x, dy = p.hIn.y - y;
+      if (Math.sqrt(dx*dx + dy*dy) <= hr) {
+        penDrag = { kind: 'hIn', index: i };
+        return;
+      }
+    }
+    if (p.hOut) {
+      const dx = p.hOut.x - x, dy = p.hOut.y - y;
+      if (Math.sqrt(dx*dx + dy*dy) <= hr) {
+        penDrag = { kind: 'hOut', index: i };
+        return;
+      }
+    }
+  }
+
+  // ②アンカー近傍
+  for (let i = 0; i < penPath.length; i++) {
+    const dx = penPath[i].x - x, dy = penPath[i].y - y;
+    if (Math.sqrt(dx*dx + dy*dy) <= hr) {
+      // ③始点クリックでclose
+      if (i === 0 && penPath.length >= 3 && !penClosed) {
+        penClosed = true;
+        drawPenOverlay();
+        return;
+      }
+      penDrag = { kind: 'anchor', index: i };
+      return;
+    }
+  }
+
+  // ④空白: 新規アンカー追加
+  if (!penClosed) {
+    penPath.push({ x, y, hIn: null, hOut: null });
+    penDrag = { kind: 'new', index: penPath.length - 1 };
+  }
+  drawPenOverlay();
+}
+
+function rasterizePen() {
+  if (penPath.length < 2) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(penPath[0].x, penPath[0].y);
+  for (let i = 0; i < penPath.length - 1; i++) {
+    const p0 = penPath[i];
+    const p1 = penPath[i + 1];
+    const c1x = p0.hOut ? p0.hOut.x : p0.x;
+    const c1y = p0.hOut ? p0.hOut.y : p0.y;
+    const c2x = p1.hIn ? p1.hIn.x : p1.x;
+    const c2y = p1.hIn ? p1.hIn.y : p1.y;
+    ctx.bezierCurveTo(c1x, c1y, c2x, c2y, p1.x, p1.y);
+  }
+  if (penClosed) {
+    const p0 = penPath[penPath.length - 1];
+    const p1 = penPath[0];
+    const c1x = p0.hOut ? p0.hOut.x : p0.x;
+    const c1y = p0.hOut ? p0.hOut.y : p0.y;
+    const c2x = p1.hIn ? p1.hIn.x : p1.x;
+    const c2y = p1.hIn ? p1.hIn.y : p1.y;
+    ctx.bezierCurveTo(c1x, c1y, c2x, c2y, p1.x, p1.y);
+  }
+  if (penClosed) ctx.closePath();
+  ctx.strokeStyle = col;
+  ctx.lineWidth = size;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.restore();
+  penPath = []; penClosed = false; penDrag = null;
+  poctx.clearRect(0, 0, penOverlay.width, penOverlay.height);
+  save();
+}
 </script>
 </body>
 </html>
