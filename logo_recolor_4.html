@@ -113,6 +113,16 @@
   #ctxMenu td { padding: 3px 6px; }
   #ctxMenu td:first-child { color: #aaa; white-space: nowrap; }
   #ctxMenu td:last-child { color: #eee; }
+  #brushCursor {
+    position: fixed;
+    pointer-events: none;
+    border-radius: 50%;
+    border: 1px solid #000;
+    box-shadow: 0 0 0 1px #fff;
+    display: none;
+    z-index: 300;
+    transform: translate(-50%, -50%);
+  }
 </style>
 </head>
 <body>
@@ -123,12 +133,14 @@
   <button id="t-bucket" onclick="setTool('bucket')">バケツ</button>
   <button id="t-wand" onclick="setTool('wand')">自動選択</button>
   <button id="t-sel" onclick="setTool('sel')">筆選択</button>
+  <button id="t-spuit" onclick="setTool('spuit')">スポイト</button>
   <button id="swatchBtn" style="background:#ff0000" onclick="togglePicker(event)"></button>
   <input type="text" id="hex" value="#FF0000" maxlength="7">
   <span id="preset"></span>
   <span id="recent"></span>
   <label>太さ <input type="range" id="sz" min="1" max="100" value="15"> <input type="number" class="num-sync" id="szNum" min="1" max="100" step="1" value="15"></label>
   <label>許容差 <input type="range" id="tol" min="0" max="150" value="30"> <input type="number" class="num-sync" id="tolNum" min="0" max="150" step="1" value="30"></label>
+  <label>ぼかし <input type="range" id="feath" min="0" max="20" step="1" value="0"> <input type="number" class="num-sync" id="feathNum" min="0" max="20" step="1" value="0"></label>
   <label title="クロージング半径(0=OFF)">穴埋め <input type="number" class="num-sync" id="closeR" min="0" max="5" step="1" value="1" style="width:40px"></label>
   <label title="境界ソフト化"><input type="checkbox" id="softenChk" checked> 境界補完</label>
   <label title="連結のみ選択"><input type="checkbox" id="connectedChk" checked> 連結のみ</label>
@@ -152,6 +164,7 @@
 <div id="picker" hidden><canvas id="pickCanvas" width="220" height="220"></canvas></div>
 <div class="drop" id="drop">ドロップで読み込み</div>
 <input type="file" id="f" accept="image/*" style="display:none">
+<div id="brushCursor"></div>
 <div id="ctxMenu">
   <table>
     <tr><td>ホイール</td><td>スクロール</td></tr>
@@ -162,6 +175,19 @@
     <tr><td>Del / Backspace</td><td>選択範囲を透過</td></tr>
     <tr><td>Esc</td><td>選択解除</td></tr>
     <tr><td>右クリック</td><td>このヘルプ表示</td></tr>
+    <tr><td colspan="2" style="color:#666;padding-top:6px">ツール切替ショートカット</td></tr>
+    <tr><td>B</td><td>筆</td></tr>
+    <tr><td>G</td><td>バケツ</td></tr>
+    <tr><td>W</td><td>自動選択</td></tr>
+    <tr><td>S</td><td>筆選択</td></tr>
+    <tr><td>I</td><td>スポイト</td></tr>
+    <tr><td colspan="2" style="color:#666;padding-top:6px">自動選択（Wand）修飾キー</td></tr>
+    <tr><td>クリック</td><td>選択置換</td></tr>
+    <tr><td>Shift+クリック</td><td>選択追加</td></tr>
+    <tr><td>Alt+クリック</td><td>選択減算</td></tr>
+    <tr><td>Shift+Alt+クリック</td><td>選択の交差</td></tr>
+    <tr><td colspan="2" style="color:#666;padding-top:6px">スポイト</td></tr>
+    <tr><td>Alt+クリック</td><td>スポイト（Wand以外のツール時）</td></tr>
   </table>
 </div>
 
@@ -171,14 +197,17 @@ const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d', { willReadFrequently: true });
 const sel = document.getElementById('sel');
 const sctx = sel.getContext('2d');
-let tool = 'brush', col = '#ff0000', size = 15, tol = 30;
+let tool = 'brush', col = '#ff0000', size = 15, tol = 30, feather = 0;
 let mask = null, hasSel = false, drawing = false, lx = 0, ly = 0;
 let hist = [], idx = -1;
 
 function setTool(t) {
   tool = t;
   document.querySelectorAll('[id^=t-]').forEach(b => b.classList.remove('on'));
-  document.getElementById('t-' + t).classList.add('on');
+  const btn = document.getElementById('t-' + t);
+  if (btn) btn.classList.add('on');
+  updateBrushCursorVisibility();
+  cv.style.cursor = (t === 'spuit') ? 'crosshair' : '';
 }
 
 // Hex入力
@@ -193,10 +222,14 @@ const szRange = document.getElementById('sz');
 const szNum   = document.getElementById('szNum');
 const tolRange = document.getElementById('tol');
 const tolNum   = document.getElementById('tolNum');
-szRange.oninput = e => { size = +e.target.value; szNum.value = size; };
-szNum.oninput   = e => { size = Math.max(1, Math.min(100, +e.target.value)); szRange.value = size; };
+const feathRange = document.getElementById('feath');
+const feathNum   = document.getElementById('feathNum');
+szRange.oninput = e => { size = +e.target.value; szNum.value = size; updateBrushCursorSize(); };
+szNum.oninput   = e => { size = Math.max(1, Math.min(100, +e.target.value)); szRange.value = size; updateBrushCursorSize(); };
 tolRange.oninput = e => { tol = +e.target.value; tolNum.value = tol; };
 tolNum.oninput   = e => { tol = Math.max(0, Math.min(150, +e.target.value)); tolRange.value = tol; };
+feathRange.oninput = e => { feather = +e.target.value; feathNum.value = feather; };
+feathNum.oninput   = e => { feather = Math.max(0, Math.min(20, +e.target.value)); feathRange.value = feather; };
 
 // パレット
 const DEFAULTS = ['#000000','#ffffff','#808080','#ff0000','#ff8c00','#ffd700','#00c853','#00bcd4','#2196f3','#3f51b5','#9c27b0','#e91e63'];
@@ -242,7 +275,6 @@ function setColor(c, fromPicker) {
   if (!fromPicker) {
     const rgb = hex2rgb(c);
     const nh = rgb2hsv(rgb.r, rgb.g, rgb.b);
-    // 黒/白の時は色相を維持する
     if (nh.s > 0.001 && nh.v > 0.001) hsv = nh;
     else { hsv.s = nh.s; hsv.v = nh.v; }
   }
@@ -293,7 +325,6 @@ function drawPicker() {
   const pc = document.getElementById('pickCanvas');
   const pctx = pc.getContext('2d');
   pctx.clearRect(0, 0, PSIZE, PSIZE);
-  // 色相環（conic gradient → ring mask）
   const grad = pctx.createConicGradient(-Math.PI/2, PCX, PCY);
   for (let i = 0; i <= 12; i++) grad.addColorStop(i/12, `hsl(${i*30},100%,50%)`);
   pctx.fillStyle = grad;
@@ -306,7 +337,6 @@ function drawPicker() {
   pctx.arc(PCX, PCY, RING_IN, 0, Math.PI*2);
   pctx.fill();
   pctx.restore();
-  // SVスクエア
   const x0 = PCX - SV/2, y0 = PCY - SV/2;
   pctx.fillStyle = `hsl(${hsv.h},100%,50%)`;
   pctx.fillRect(x0, y0, SV, SV);
@@ -316,11 +346,9 @@ function drawPicker() {
   const g2 = pctx.createLinearGradient(0, y0, 0, y0+SV);
   g2.addColorStop(0, 'rgba(0,0,0,0)'); g2.addColorStop(1, '#000');
   pctx.fillStyle = g2; pctx.fillRect(x0, y0, SV, SV);
-  // 色相インジケータ
   const ha = (hsv.h - 90) * Math.PI / 180;
   const hr = (RING_OUT + RING_IN) / 2;
   ringMarker(pctx, PCX + Math.cos(ha)*hr, PCY + Math.sin(ha)*hr, 7);
-  // SVインジケータ
   ringMarker(pctx, x0 + hsv.s*SV, y0 + (1-hsv.v)*SV, 5);
 }
 function ringMarker(c, x, y, r) {
@@ -403,7 +431,7 @@ function loadSvg(text) {
   const vb = el.getAttribute('viewBox');
   if (vb) { const p = vb.split(/[\s,]+/).map(Number); w = p[2]; h = p[3]; }
   else { w = parseFloat(el.getAttribute('width')) || 300; h = parseFloat(el.getAttribute('height')) || 150; }
-  const s = Math.max(1, 2000 / Math.max(w, h)); // 長辺2000pxまで拡大
+  const s = Math.max(1, 2000 / Math.max(w, h));
   el.setAttribute('width', Math.round(w * s));
   el.setAttribute('height', Math.round(h * s));
   if (!vb) el.setAttribute('viewBox', `0 0 ${w} ${h}`);
@@ -456,19 +484,44 @@ cv.onmousedown = e => {
   if (!mask) return;
   const { x, y } = coord(e);
   drawing = true; lx = x; ly = y;
+
   if (tool === 'brush') { strokeBegin(); drawDot(x, y); }
   else if (tool === 'bucket') { bucket(x, y); save(); drawing = false; }
-  else if (tool === 'wand') { wand(x, y); drawing = false; }
+  else if (tool === 'wand') {
+    if (e.altKey && !e.shiftKey) {
+      wand(x, y, 'sub');
+    } else if (e.shiftKey && e.altKey) {
+      wand(x, y, 'intersect');
+    } else if (e.shiftKey) {
+      wand(x, y, 'add');
+    } else {
+      wand(x, y, 'replace');
+    }
+    drawing = false;
+  }
   else if (tool === 'sel') { paintSel(x, y); renderSel(); }
+  else if (tool === 'spuit') { pickColor(x, y); drawing = false; }
+  else if (e.altKey && tool !== 'wand') {
+    // Alt+クリックでスポイト（wand以外）
+    pickColor(x, y); drawing = false;
+  }
 };
+
+
 cv.onmousemove = e => {
   if (panning) return;
+  updateBrushCursorPos(e);
   if (!drawing) return;
   const { x, y } = coord(e);
   if (tool === 'brush') line(lx, ly, x, y);
-  else if (tool === 'sel') { paintSelLine(lx, ly, x, y); renderSel(); }
+  else if (tool === 'sel') { paintSelLine(lx, ly, x, y); renderSel(true); }
   lx = x; ly = y;
 };
+
+cv.addEventListener('mouseleave', () => {
+  document.getElementById('brushCursor').style.display = 'none';
+});
+
 addEventListener('mousemove', e => {
   if (panning) {
     mainEl.scrollLeft = panSL - (e.clientX - panSX);
@@ -478,8 +531,18 @@ addEventListener('mousemove', e => {
 addEventListener('mouseup', () => {
   if (panning) { panning = false; document.body.style.cursor = spaceDown ? 'grab' : ''; return; }
   if (drawing && tool === 'brush') save();
+  if (drawing && tool === 'sel' && feather > 0) renderSel();
   drawing = false;
 });
+
+// スポイト: クリック位置の色取得
+function pickColor(x, y) {
+  if (x < 0 || y < 0 || x >= cv.width || y >= cv.height) return;
+  const d = ctx.getImageData(x, y, 1, 1).data;
+  if (d[3] === 0) return;
+  const hex = '#' + [d[0], d[1], d[2]].map(v => v.toString(16).padStart(2,'0')).join('');
+  setColor(hex);
+}
 
 // 筆ストローク用のバッファ。選択がある場合はマスクを当ててから本体に反映
 let preStroke = null, strokeC = null, strokeX = null, maskC = null;
@@ -549,11 +612,59 @@ function bucket(sx, sy) {
   ctx.putImageData(im, 0, 0);
 }
 
+// マスクのガウスぼかし近似（2パス box blur）
+function blurMask(src, w, h, r) {
+  if (r <= 0) return src;
+  const tmp = new Float32Array(w * h);
+  const dst = new Float32Array(w * h);
+  // 水平パス
+  for (let y = 0; y < h; y++) {
+    let sum = 0;
+    for (let x = 0; x < r; x++) sum += src[y*w+x];
+    for (let x = 0; x < w; x++) {
+      if (x + r < w) sum += src[y*w + x + r];
+      if (x - r - 1 >= 0) sum -= src[y*w + x - r - 1];
+      tmp[y*w+x] = sum / (Math.min(x+r+1, w) - Math.max(0, x-r));
+    }
+  }
+  // 垂直パス
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    for (let y = 0; y < r; y++) sum += tmp[y*w+x];
+    for (let y = 0; y < h; y++) {
+      if (y + r < h) sum += tmp[(y+r)*w+x];
+      if (y - r - 1 >= 0) sum -= tmp[(y-r-1)*w+x];
+      dst[y*w+x] = sum / (Math.min(y+r+1, h) - Math.max(0, y-r));
+    }
+  }
+  // 2回目パス（より滑らかなガウス近似）
+  const tmp2 = new Float32Array(w * h);
+  const dst2 = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let sum = 0;
+    for (let x = 0; x < r; x++) sum += dst[y*w+x];
+    for (let x = 0; x < w; x++) {
+      if (x + r < w) sum += dst[y*w + x + r];
+      if (x - r - 1 >= 0) sum -= dst[y*w + x - r - 1];
+      tmp2[y*w+x] = sum / (Math.min(x+r+1, w) - Math.max(0, x-r));
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    for (let y = 0; y < r; y++) sum += tmp2[y*w+x];
+    for (let y = 0; y < h; y++) {
+      if (y + r < h) sum += tmp2[(y+r)*w+x];
+      if (y - r - 1 >= 0) sum -= tmp2[(y-r-1)*w+x];
+      dst2[y*w+x] = sum / (Math.min(y+r+1, h) - Math.max(0, y-r));
+    }
+  }
+  return dst2;
+}
+
 // wand後処理: マスク内部の小穴を埋める (dilate→erode)
 function closeMask(mask, w, h, r) {
   if (r <= 0) return;
   let cur = mask;
-  // dilate r回
   for (let pass = 0; pass < r; pass++) {
     const next = new Uint8Array(w * h);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -563,7 +674,6 @@ function closeMask(mask, w, h, r) {
     }
     cur = next;
   }
-  // erode r回
   for (let pass = 0; pass < r; pass++) {
     const next = new Uint8Array(w * h);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -583,7 +693,6 @@ function softenEdge(mask, w, h, r0, g0, b0, a0, tolSoft, d) {
   const orig = mask.slice();
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     if (!orig[y*w+x]) continue;
-    // 境界画素か確認
     const isBorder = (x>0 && !orig[y*w+x-1]) || (x<w-1 && !orig[y*w+x+1]) ||
                      (y>0 && !orig[(y-1)*w+x]) || (y<h-1 && !orig[(y+1)*w+x]);
     if (!isBorder) continue;
@@ -598,12 +707,15 @@ function softenEdge(mask, w, h, r0, g0, b0, a0, tolSoft, d) {
   }
 }
 
-function wand(sx, sy) {
+function wand(sx, sy, mode) {
+  if (mode === undefined) mode = 'replace';
   const w = cv.width, h = cv.height;
   const im = ctx.getImageData(0,0,w,h), d = im.data;
   const i0 = (sy*w + sx)*4;
   const r0=d[i0], g0=d[i0+1], b0=d[i0+2], a0=d[i0+3];
-  mask.fill(0);
+
+  // 一時マスクに flood fill
+  const tmpMask = new Uint8Array(w * h);
   const t2 = tol*tol*4;
   const connected = document.getElementById('connectedChk').checked;
   if (connected) {
@@ -612,25 +724,37 @@ function wand(sx, sy) {
       const y = st.pop(), x = st.pop();
       if (x<0||y<0||x>=w||y>=h) continue;
       const i = y*w+x;
-      if (mask[i]) continue;
+      if (tmpMask[i]) continue;
       const k = i*4;
       const dr=d[k]-r0, dg=d[k+1]-g0, db=d[k+2]-b0, da=d[k+3]-a0;
       if (dr*dr+dg*dg+db*db+da*da > t2) continue;
-      mask[i] = 1;
+      tmpMask[i] = 1;
       st.push(x+1,y, x-1,y, x,y+1, x,y-1);
     }
   } else {
     for (let i = 0; i < w*h; i++) {
       const k = i*4;
       const dr=d[k]-r0, dg=d[k+1]-g0, db=d[k+2]-b0, da=d[k+3]-a0;
-      if (dr*dr+dg*dg+db*db+da*da <= t2) mask[i] = 1;
+      if (dr*dr+dg*dg+db*db+da*da <= t2) tmpMask[i] = 1;
     }
   }
   const closeR = +document.getElementById('closeR').value;
-  closeMask(mask, w, h, closeR);
+  closeMask(tmpMask, w, h, closeR);
   if (document.getElementById('softenChk').checked) {
-    softenEdge(mask, w, h, r0, g0, b0, a0, tol * 1.8, d);
+    softenEdge(tmpMask, w, h, r0, g0, b0, a0, tol * 1.8, d);
   }
+
+  // モードに応じて既存マスクとマージ
+  if (mode === 'replace' || !hasSel) {
+    for (let i = 0; i < mask.length; i++) mask[i] = tmpMask[i];
+  } else if (mode === 'add') {
+    for (let i = 0; i < mask.length; i++) mask[i] = mask[i] | tmpMask[i];
+  } else if (mode === 'sub') {
+    for (let i = 0; i < mask.length; i++) mask[i] = mask[i] & (tmpMask[i] ? 0 : 1);
+  } else if (mode === 'intersect') {
+    for (let i = 0; i < mask.length; i++) mask[i] = mask[i] & tmpMask[i];
+  }
+
   hasSel = true;
   renderSel();
 }
@@ -653,36 +777,99 @@ function paintSelLine(x1, y1, x2, y2) {
   }
 }
 
-function renderSel() {
-  const w = cv.width, h = cv.height;
-  const im = sctx.createImageData(w, h), d = im.data;
-  for (let i=0; i<mask.length; i++) {
-    if (mask[i]) { d[i*4]=80; d[i*4+1]=150; d[i*4+2]=255; d[i*4+3]=120; }
+function renderSel(quick) {
+  if (feather === 0 || quick) {
+    const w = cv.width, h = cv.height;
+    const im = sctx.createImageData(w, h), d = im.data;
+    for (let i=0; i<mask.length; i++) {
+      if (mask[i]) { d[i*4]=80; d[i*4+1]=150; d[i*4+2]=255; d[i*4+3]=120; }
+    }
+    sctx.putImageData(im, 0, 0);
+  } else {
+    const w = cv.width, h = cv.height;
+    const blurred = blurMask(mask, w, h, feather);
+    const im = sctx.createImageData(w, h), d = im.data;
+    for (let i=0; i<mask.length; i++) {
+      const a = blurred[i];
+      if (a > 0) {
+        d[i*4]=80; d[i*4+1]=150; d[i*4+2]=255;
+        d[i*4+3] = Math.round(a * 120);
+      }
+    }
+    sctx.putImageData(im, 0, 0);
   }
-  sctx.putImageData(im, 0, 0);
 }
 
 function fillSel() {
   if (!hasSel) return;
   const im = ctx.getImageData(0,0,cv.width,cv.height), d = im.data;
   const c = hex2rgb(col);
-  for (let i=0; i<mask.length; i++) {
-    if (mask[i]) { d[i*4]=c.r; d[i*4+1]=c.g; d[i*4+2]=c.b; d[i*4+3]=255; }
+  if (feather === 0) {
+    for (let i=0; i<mask.length; i++) {
+      if (mask[i]) { d[i*4]=c.r; d[i*4+1]=c.g; d[i*4+2]=c.b; d[i*4+3]=255; }
+    }
+  } else {
+    const blurred = blurMask(mask, cv.width, cv.height, feather);
+    for (let i=0; i<mask.length; i++) {
+      const a = blurred[i];
+      if (a <= 0) continue;
+      const k = i*4;
+      d[k]   = Math.round(d[k]   * (1-a) + c.r * a);
+      d[k+1] = Math.round(d[k+1] * (1-a) + c.g * a);
+      d[k+2] = Math.round(d[k+2] * (1-a) + c.b * a);
+      d[k+3] = Math.min(255, Math.round(d[k+3] + (255 - d[k+3]) * a));
+    }
   }
   ctx.putImageData(im, 0, 0);
   save();
 }
+
 function delSel() {
   if (!hasSel) return;
   const im = ctx.getImageData(0,0,cv.width,cv.height), d = im.data;
-  for (let i=0; i<mask.length; i++) if (mask[i]) d[i*4+3] = 0;
+  if (feather === 0) {
+    for (let i=0; i<mask.length; i++) if (mask[i]) d[i*4+3] = 0;
+  } else {
+    const blurred = blurMask(mask, cv.width, cv.height, feather);
+    for (let i=0; i<mask.length; i++) {
+      const a = blurred[i];
+      if (a <= 0) continue;
+      d[i*4+3] = Math.max(0, Math.round(d[i*4+3] * (1-a)));
+    }
+  }
   ctx.putImageData(im, 0, 0);
   save();
 }
+
 function clearSel() {
   if (!mask) return;
   mask.fill(0); hasSel = false;
   sctx.clearRect(0, 0, cv.width, cv.height);
+}
+
+// ブラシカーソルリング
+const brushCursorEl = document.getElementById('brushCursor');
+function updateBrushCursorVisibility() {
+  const show = (tool === 'brush' || tool === 'sel');
+  brushCursorEl.style.display = show ? 'block' : 'none';
+}
+function updateBrushCursorSize() {
+  const r = cv.getBoundingClientRect();
+  const cssRadius = (size / 2) * (r.width / cv.width);
+  const d = cssRadius * 2;
+  brushCursorEl.style.width = d + 'px';
+  brushCursorEl.style.height = d + 'px';
+}
+function updateBrushCursorPos(e) {
+  if (tool !== 'brush' && tool !== 'sel') return;
+  const r = cv.getBoundingClientRect();
+  const cssRadius = (size / 2) * (r.width / cv.width);
+  const d = cssRadius * 2;
+  brushCursorEl.style.width = d + 'px';
+  brushCursorEl.style.height = d + 'px';
+  brushCursorEl.style.left = e.clientX + 'px';
+  brushCursorEl.style.top  = e.clientY + 'px';
+  brushCursorEl.style.display = 'block';
 }
 
 // スペース押しながらドラッグでパン
@@ -696,11 +883,18 @@ addEventListener('keydown', e => {
     return;
   }
   const t = (e.target.tagName||'').toLowerCase();
-  if (t==='input') return;
+  if (t==='input' || t==='textarea') return;
   if (e.key==='Delete' || e.key==='Backspace') { if (hasSel) { e.preventDefault(); delSel(); } }
   else if (e.key==='Escape') clearSel();
   else if ((e.ctrlKey||e.metaKey) && (e.key==='z' || e.key==='Z')) { e.preventDefault(); e.shiftKey ? redo() : undo(); }
   else if ((e.ctrlKey||e.metaKey) && e.key==='0') { e.preventDefault(); fit(); }
+  else if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+    if (e.key === 'b' || e.key === 'B') setTool('brush');
+    else if (e.key === 'g' || e.key === 'G') setTool('bucket');
+    else if (e.key === 'w' || e.key === 'W') setTool('wand');
+    else if (e.key === 's' || e.key === 'S') setTool('sel');
+    else if (e.key === 'i' || e.key === 'I') setTool('spuit');
+  }
 });
 addEventListener('keyup', e => {
   if (e.code === 'Space') {
@@ -713,7 +907,7 @@ function snap() { return ctx.getImageData(0,0,cv.width,cv.height); }
 function save() {
   hist = hist.slice(0, idx + 1);
   hist.push(snap());
-  if (hist.length > 25) hist.shift();
+  if (hist.length > 90) hist.shift();
   idx = hist.length - 1;
 }
 function undo() { if (idx > 0) { idx--; ctx.putImageData(hist[idx], 0, 0); } }
@@ -753,6 +947,7 @@ function applyZoom() {
   const w = cv.width * zoom, h = cv.height * zoom;
   cv.style.width = sel.style.width = w + 'px';
   cv.style.height = sel.style.height = h + 'px';
+  updateBrushCursorSize();
 }
 const mainEl = document.querySelector('main');
 function fit() {
