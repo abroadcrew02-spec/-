@@ -134,6 +134,7 @@
   <button id="t-wand" onclick="setTool('wand')">自動選択</button>
   <button id="t-sel" onclick="setTool('sel')">筆選択</button>
   <button id="t-spuit" onclick="setTool('spuit')">スポイト</button>
+  <button id="t-replace" onclick="setTool('replace')">色置換</button>
   <button id="swatchBtn" style="background:#ff0000" onclick="togglePicker(event)"></button>
   <input type="text" id="hex" value="#FF0000" maxlength="7">
   <span id="preset"></span>
@@ -142,6 +143,8 @@
   <label>許容差 <input type="range" id="tol" min="0" max="150" value="30"> <input type="number" class="num-sync" id="tolNum" min="0" max="150" step="1" value="30"></label>
   <label>ぼかし <input type="range" id="feath" min="0" max="20" step="1" value="0"> <input type="number" class="num-sync" id="feathNum" min="0" max="20" step="1" value="0"></label>
   <label title="クロージング半径(0=OFF)">穴埋め <input type="number" class="num-sync" id="closeR" min="0" max="5" step="1" value="1" style="width:40px"></label>
+  <label>置換許容差 <input type="range" id="repTol" min="0" max="150" step="1" value="30"> <input type="number" class="num-sync" id="repTolNum" min="0" max="150" step="1" value="30"></label>
+  <label title="境界を滑らかにブレンド"><input type="checkbox" id="smoothReplaceChk"> 滑らかに置換</label>
   <label title="境界ソフト化"><input type="checkbox" id="softenChk" checked> 境界補完</label>
   <label title="連結のみ選択"><input type="checkbox" id="connectedChk" checked> 連結のみ</label>
   <button onclick="fillSel()">選択を塗る</button>
@@ -168,7 +171,7 @@
 <div id="ctxMenu">
   <table>
     <tr><td>ホイール</td><td>スクロール</td></tr>
-    <tr><td>Alt+ホイール</td><td>拡大縮小</td></tr>
+    <tr><td>Ctrl+ホイール</td><td>拡大縮小</td></tr>
     <tr><td>スペース+ドラッグ</td><td>手のひら（パン）</td></tr>
     <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>元に戻す / やり直し</td></tr>
     <tr><td>Ctrl+0</td><td>画面にフィット</td></tr>
@@ -181,6 +184,7 @@
     <tr><td>W</td><td>自動選択</td></tr>
     <tr><td>S</td><td>筆選択</td></tr>
     <tr><td>I</td><td>スポイト</td></tr>
+    <tr><td>R</td><td>色置換</td></tr>
     <tr><td colspan="2" style="color:#666;padding-top:6px">自動選択（Wand）修飾キー</td></tr>
     <tr><td>クリック</td><td>選択置換</td></tr>
     <tr><td>Shift+クリック</td><td>選択追加</td></tr>
@@ -197,7 +201,7 @@ const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d', { willReadFrequently: true });
 const sel = document.getElementById('sel');
 const sctx = sel.getContext('2d');
-let tool = 'brush', col = '#ff0000', size = 15, tol = 30, feather = 0;
+let tool = 'brush', col = '#ff0000', size = 15, tol = 30, feather = 0, repTol = 30;
 let mask = null, hasSel = false, drawing = false, lx = 0, ly = 0;
 let hist = [], idx = -1;
 
@@ -207,7 +211,7 @@ function setTool(t) {
   const btn = document.getElementById('t-' + t);
   if (btn) btn.classList.add('on');
   updateBrushCursorVisibility();
-  cv.style.cursor = (t === 'spuit') ? 'crosshair' : '';
+  cv.style.cursor = (t === 'spuit' || t === 'replace') ? 'crosshair' : '';
 }
 
 // Hex入力
@@ -230,6 +234,10 @@ tolRange.oninput = e => { tol = +e.target.value; tolNum.value = tol; };
 tolNum.oninput   = e => { tol = Math.max(0, Math.min(150, +e.target.value)); tolRange.value = tol; };
 feathRange.oninput = e => { feather = +e.target.value; feathNum.value = feather; };
 feathNum.oninput   = e => { feather = Math.max(0, Math.min(20, +e.target.value)); feathRange.value = feather; };
+const repTolRange = document.getElementById('repTol');
+const repTolNum   = document.getElementById('repTolNum');
+repTolRange.oninput = e => { repTol = +e.target.value; repTolNum.value = repTol; };
+repTolNum.oninput   = e => { repTol = Math.max(0, Math.min(150, +e.target.value)); repTolRange.value = repTol; };
 
 // パレット
 const DEFAULTS = ['#000000','#ffffff','#808080','#ff0000','#ff8c00','#ffd700','#00c853','#00bcd4','#2196f3','#3f51b5','#9c27b0','#e91e63'];
@@ -501,6 +509,7 @@ cv.onmousedown = e => {
   }
   else if (tool === 'sel') { paintSel(x, y); renderSel(); }
   else if (tool === 'spuit') { pickColor(x, y); drawing = false; }
+  else if (tool === 'replace') { replaceColor(x, y); drawing = false; }
   else if (e.altKey && tool !== 'wand') {
     // Alt+クリックでスポイト（wand以外）
     pickColor(x, y); drawing = false;
@@ -542,6 +551,43 @@ function pickColor(x, y) {
   if (d[3] === 0) return;
   const hex = '#' + [d[0], d[1], d[2]].map(v => v.toString(16).padStart(2,'0')).join('');
   setColor(hex);
+}
+
+// 色置換: クリック位置の色を前景色に一括置換
+function replaceColor(sx, sy) {
+  if (sx < 0 || sy < 0 || sx >= cv.width || sy >= cv.height) return;
+  const w = cv.width, h = cv.height;
+  const im = ctx.getImageData(0, 0, w, h), d = im.data;
+  const i0 = (sy * w + sx) * 4;
+  const r0 = d[i0], g0 = d[i0+1], b0 = d[i0+2], a0 = d[i0+3];
+  if (a0 === 0) return;
+  const f = hex2rgb(col);
+  const fr = f.r, fg = f.g, fb = f.b;
+  const t2 = repTol * repTol * 4;
+  const smooth = document.getElementById('smoothReplaceChk').checked;
+  const denom = repTol * 2;
+  for (let i = 0; i < w * h; i++) {
+    if (hasSel && !mask[i]) continue;
+    const k = i * 4;
+    const dr = d[k] - r0, dg = d[k+1] - g0, db = d[k+2] - b0;
+    const dist2 = dr*dr + dg*dg + db*db;
+    if (!smooth) {
+      if (dist2 <= t2) {
+        d[k] = fr; d[k+1] = fg; d[k+2] = fb;
+      }
+    } else {
+      if (dist2 <= t2) {
+        const a = denom > 0 ? Math.max(0, Math.min(1, 1 - Math.sqrt(dist2) / denom)) : 1;
+        if (a > 0) {
+          d[k]   = Math.round(d[k]   * (1 - a) + fr * a);
+          d[k+1] = Math.round(d[k+1] * (1 - a) + fg * a);
+          d[k+2] = Math.round(d[k+2] * (1 - a) + fb * a);
+        }
+      }
+    }
+  }
+  ctx.putImageData(im, 0, 0);
+  save();
 }
 
 // 筆ストローク用のバッファ。選択がある場合はマスクを当ててから本体に反映
@@ -894,6 +940,7 @@ addEventListener('keydown', e => {
     else if (e.key === 'w' || e.key === 'W') setTool('wand');
     else if (e.key === 's' || e.key === 'S') setTool('sel');
     else if (e.key === 'i' || e.key === 'I') setTool('spuit');
+    else if (e.key === 'r' || e.key === 'R') setTool('replace');
   }
 });
 addEventListener('keyup', e => {
@@ -941,7 +988,7 @@ function dl(b, n) {
 
 function hex2rgb(h) { const v = parseInt(h.slice(1), 16); return { r:(v>>16)&255, g:(v>>8)&255, b:v&255 }; }
 
-// Alt+ホイールでズーム（カーソル位置を中心に）
+// Ctrl+ホイールでズーム（カーソル位置を中心に）
 let zoom = 1;
 function applyZoom() {
   const w = cv.width * zoom, h = cv.height * zoom;
@@ -960,7 +1007,7 @@ function fit() {
   mainEl.scrollTop = 0;
 }
 mainEl.addEventListener('wheel', e => {
-  if (!e.altKey) return;
+  if (!e.ctrlKey) return;
   if (!mask) return;
   e.preventDefault();
   const old = zoom;
